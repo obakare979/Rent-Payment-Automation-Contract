@@ -9,6 +9,10 @@
 (define-constant ERR_LEASE_ALREADY_EXISTS (err u107))
 (define-constant ERR_PROPERTY_ALREADY_EXISTS (err u108))
 
+(define-constant ERR_SCHEDULE_NOT_FOUND (err u109))
+(define-constant ERR_SCHEDULE_ALREADY_EXISTS (err u110))
+(define-constant ERR_SCHEDULE_DISABLED (err u111))
+
 (define-map properties
   { property-id: uint }
   {
@@ -136,7 +140,8 @@
       (merge lease { last-payment-block: stacks-block-height })
     )
     
-    (as-contract (stx-transfer? total-amount tx-sender (get landlord property)))
+    (try! (as-contract (stx-transfer? total-amount tx-sender (get landlord property))))
+    (ok true)
   )
 )
 
@@ -211,13 +216,102 @@
 )
 
 (define-read-only (calculate-monthly-due (property-id uint) (tenant principal))
-  (let (
-    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tenant }) ERR_LEASE_NOT_FOUND))
-    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
-    (rent-amount (get monthly-rent lease))
-    (is-late (is-payment-late property-id (get start-block lease) (get grace-period property)))
-    (penalty-amount (if is-late (calculate-penalty rent-amount (get penalty-rate property)) u0))
+  (match (map-get? leases { property-id: property-id, tenant: tenant })
+    lease (match (map-get? properties { property-id: property-id })
+      property (let (
+        (rent-amount (get monthly-rent lease))
+        (is-late (is-payment-late property-id (get start-block lease) (get grace-period property)))
+        (penalty-amount (if is-late (calculate-penalty rent-amount (get penalty-rate property)) u0))
+      )
+        (ok (+ rent-amount penalty-amount))
+      )
+      ERR_PROPERTY_NOT_FOUND
+    )
+    ERR_LEASE_NOT_FOUND
   )
-    (ok (+ rent-amount penalty-amount))
+)
+
+(define-map auto-payment-schedules
+  { property-id: uint, tenant: principal }
+  {
+    enabled: bool,
+    payment-day: uint,
+    last-execution: uint,
+    created-block: uint,
+    emergency-disabled: bool
+  }
+)
+
+(define-public (schedule-auto-payment (property-id uint) (payment-day uint))
+  (let (
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tx-sender }) ERR_LEASE_NOT_FOUND))
+  )
+    (asserts! (get active lease) ERR_LEASE_EXPIRED)
+    (asserts! (and (>= payment-day u1) (<= payment-day u28)) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? auto-payment-schedules { property-id: property-id, tenant: tx-sender })) ERR_SCHEDULE_ALREADY_EXISTS)
+    
+    (map-set auto-payment-schedules
+      { property-id: property-id, tenant: tx-sender }
+      {
+        enabled: true,
+        payment-day: payment-day,
+        last-execution: u0,
+        created-block: stacks-block-height,
+        emergency-disabled: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-scheduled-payment (property-id uint) (tenant principal))
+  (let (
+    (schedule (unwrap! (map-get? auto-payment-schedules { property-id: property-id, tenant: tenant }) ERR_SCHEDULE_NOT_FOUND))
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tenant }) ERR_LEASE_NOT_FOUND))
+  )
+    (asserts! (get enabled schedule) ERR_SCHEDULE_DISABLED)
+    (asserts! (not (get emergency-disabled schedule)) ERR_SCHEDULE_DISABLED)
+    (asserts! (get active lease) ERR_LEASE_EXPIRED)
+    (asserts! (is-payment-due property-id tenant (get payment-day schedule)) ERR_PAYMENT_ALREADY_MADE)
+    
+    (map-set auto-payment-schedules
+      { property-id: property-id, tenant: tenant }
+      (merge schedule { last-execution: stacks-block-height })
+    )
+    (try! (pay-rent property-id))
+    (ok true)
+  )
+)
+
+(define-public (emergency-disable-schedule (property-id uint) (tenant principal))
+  (let (
+    (schedule (unwrap! (map-get? auto-payment-schedules { property-id: property-id, tenant: tenant }) ERR_SCHEDULE_NOT_FOUND))
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+  )
+    (asserts! (is-eq (get landlord property) tx-sender) ERR_UNAUTHORIZED)
+    (map-set auto-payment-schedules
+      { property-id: property-id, tenant: tenant }
+      (merge schedule { emergency-disabled: true })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-payment-schedule (property-id uint) (tenant principal))
+  (map-get? auto-payment-schedules { property-id: property-id, tenant: tenant })
+)
+
+(define-read-only (is-payment-due (property-id uint) (tenant principal) (payment-day uint))
+  (match (map-get? leases { property-id: property-id, tenant: tenant })
+    lease (let (
+      (current-month (get-current-month (get start-block lease)))
+      (payment-record (map-get? rent-payments { property-id: property-id, tenant: tenant, payment-month: current-month }))
+    )
+      (and 
+        (>= (mod (- stacks-block-height (get start-block lease)) u4320) payment-day)
+        (is-none payment-record)
+      )
+    )
+    false
   )
 )
