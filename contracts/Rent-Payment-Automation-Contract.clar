@@ -13,6 +13,12 @@
 (define-constant ERR_SCHEDULE_ALREADY_EXISTS (err u110))
 (define-constant ERR_SCHEDULE_DISABLED (err u111))
 
+(define-constant ERR_REQUEST_NOT_FOUND (err u112))
+(define-constant ERR_REQUEST_ALREADY_EXISTS (err u113))
+(define-constant ERR_INSUFFICIENT_MAINTENANCE_FUNDS (err u114))
+(define-constant ERR_REQUEST_ALREADY_PROCESSED (err u115))
+
+
 (define-map properties
   { property-id: uint }
   {
@@ -314,4 +320,103 @@
     )
     false
   )
+)
+
+(define-map maintenance-funds
+  { property-id: uint, tenant: principal }
+  { balance: uint }
+)
+
+(define-map maintenance-requests
+  { property-id: uint, request-id: uint }
+  {
+    landlord: principal,
+    tenant: principal,
+    description: (string-ascii 200),
+    estimated-cost: uint,
+    status: (string-ascii 20),
+    submitted-block: uint,
+    processed-block: uint
+  }
+)
+
+(define-data-var request-counter uint u0)
+
+(define-public (deposit-maintenance-funds (property-id uint) (amount uint))
+  (let (
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tx-sender }) ERR_LEASE_NOT_FOUND))
+    (current-balance (default-to u0 (get balance (map-get? maintenance-funds { property-id: property-id, tenant: tx-sender }))))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active lease) ERR_LEASE_EXPIRED)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set maintenance-funds
+      { property-id: property-id, tenant: tx-sender }
+      { balance: (+ current-balance amount) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (submit-maintenance-request (property-id uint) (tenant principal) (description (string-ascii 200)) (estimated-cost uint))
+  (let (
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+    (request-id (+ (var-get request-counter) u1))
+    (maintenance-balance (default-to u0 (get balance (map-get? maintenance-funds { property-id: property-id, tenant: tenant }))))
+  )
+    (asserts! (is-eq (get landlord property) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> estimated-cost u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= maintenance-balance estimated-cost) ERR_INSUFFICIENT_MAINTENANCE_FUNDS)
+    (map-set maintenance-requests
+      { property-id: property-id, request-id: request-id }
+      {
+        landlord: tx-sender,
+        tenant: tenant,
+        description: description,
+        estimated-cost: estimated-cost,
+        status: "pending",
+        submitted-block: stacks-block-height,
+        processed-block: u0
+      }
+    )
+    (var-set request-counter request-id)
+    (ok request-id)
+  )
+)
+
+(define-public (process-maintenance-request (property-id uint) (request-id uint) (approve bool))
+  (let (
+    (request (unwrap! (map-get? maintenance-requests { property-id: property-id, request-id: request-id }) ERR_REQUEST_NOT_FOUND))
+    (maintenance-balance (default-to u0 (get balance (map-get? maintenance-funds { property-id: property-id, tenant: tx-sender }))))
+  )
+    (asserts! (is-eq (get tenant request) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status request) "pending") ERR_REQUEST_ALREADY_PROCESSED)
+    (if approve
+      (begin
+        (asserts! (>= maintenance-balance (get estimated-cost request)) ERR_INSUFFICIENT_MAINTENANCE_FUNDS)
+        (map-set maintenance-funds
+          { property-id: property-id, tenant: tx-sender }
+          { balance: (- maintenance-balance (get estimated-cost request)) }
+        )
+        (try! (as-contract (stx-transfer? (get estimated-cost request) tx-sender (get landlord request))))
+        (map-set maintenance-requests
+          { property-id: property-id, request-id: request-id }
+          (merge request { status: "approved", processed-block: stacks-block-height })
+        )
+      )
+      (map-set maintenance-requests
+        { property-id: property-id, request-id: request-id }
+        (merge request { status: "rejected", processed-block: stacks-block-height })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-maintenance-balance (property-id uint) (tenant principal))
+  (default-to u0 (get balance (map-get? maintenance-funds { property-id: property-id, tenant: tenant })))
+)
+
+(define-read-only (get-maintenance-request (property-id uint) (request-id uint))
+  (map-get? maintenance-requests { property-id: property-id, request-id: request-id })
 )
