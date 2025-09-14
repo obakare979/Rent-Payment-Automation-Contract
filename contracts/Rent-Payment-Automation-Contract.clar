@@ -420,3 +420,131 @@
 (define-read-only (get-maintenance-request (property-id uint) (request-id uint))
   (map-get? maintenance-requests { property-id: property-id, request-id: request-id })
 )
+
+
+(define-map property-analytics
+  { property-id: uint }
+  {
+    total-payments: uint,
+    on-time-payments: uint,
+    total-maintenance-requests: uint,
+    avg-response-time: uint,
+    landlord-rating: uint,
+    landlord-rating-count: uint,
+    created-block: uint
+  }
+)
+
+(define-map tenant-performance
+  { property-id: uint, tenant: principal }
+  {
+    payment-streak: uint,
+    late-payments: uint,
+    maintenance-cooperation: uint,
+    tenant-rating: uint,
+    tenant-rating-count: uint,
+    performance-score: uint
+  }
+)
+
+(define-map property-ratings
+  { property-id: uint, rater: principal, rating-id: uint }
+  {
+    rating-score: uint,
+    rating-type: (string-ascii 10),
+    comment-hash: (buff 32),
+    submitted-block: uint,
+    verified: bool
+  }
+)
+
+(define-data-var rating-counter uint u0)
+
+(define-public (submit-property-rating (property-id uint) (score uint) (rating-type (string-ascii 10)) (comment-hash (buff 32)))
+  (let (
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tx-sender }) ERR_LEASE_NOT_FOUND))
+    (rating-id (+ (var-get rating-counter) u1))
+    (current-analytics (default-to 
+      { total-payments: u0, on-time-payments: u0, total-maintenance-requests: u0, avg-response-time: u0, landlord-rating: u0, landlord-rating-count: u0, created-block: stacks-block-height }
+      (map-get? property-analytics { property-id: property-id })
+    ))
+  )
+    (asserts! (and (>= score u1) (<= score u5)) ERR_INVALID_AMOUNT)
+    (asserts! (not (get active lease)) ERR_LEASE_EXPIRED)
+    (map-set property-ratings
+      { property-id: property-id, rater: tx-sender, rating-id: rating-id }
+      {
+        rating-score: score,
+        rating-type: rating-type,
+        comment-hash: comment-hash,
+        submitted-block: stacks-block-height,
+        verified: true
+      }
+    )
+    (map-set property-analytics
+      { property-id: property-id }
+      (merge current-analytics {
+        landlord-rating: (/ (+ (* (get landlord-rating current-analytics) (get landlord-rating-count current-analytics)) score) (+ (get landlord-rating-count current-analytics) u1)),
+        landlord-rating-count: (+ (get landlord-rating-count current-analytics) u1)
+      })
+    )
+    (var-set rating-counter rating-id)
+    (ok rating-id)
+  )
+)
+
+(define-public (update-payment-analytics (property-id uint) (tenant principal) (on-time bool))
+  (let (
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tenant }) ERR_LEASE_NOT_FOUND))
+    (current-analytics (default-to 
+      { total-payments: u0, on-time-payments: u0, total-maintenance-requests: u0, avg-response-time: u0, landlord-rating: u0, landlord-rating-count: u0, created-block: stacks-block-height }
+      (map-get? property-analytics { property-id: property-id })
+    ))
+    (current-performance (default-to 
+      { payment-streak: u0, late-payments: u0, maintenance-cooperation: u5, tenant-rating: u0, tenant-rating-count: u0, performance-score: u100 }
+      (map-get? tenant-performance { property-id: property-id, tenant: tenant })
+    ))
+  )
+    (map-set property-analytics
+      { property-id: property-id }
+      (merge current-analytics {
+        total-payments: (+ (get total-payments current-analytics) u1),
+        on-time-payments: (if on-time (+ (get on-time-payments current-analytics) u1) (get on-time-payments current-analytics))
+      })
+    )
+    (map-set tenant-performance
+      { property-id: property-id, tenant: tenant }
+      (merge current-performance {
+        payment-streak: (if on-time (+ (get payment-streak current-performance) u1) u0),
+        late-payments: (if on-time (get late-payments current-performance) (+ (get late-payments current-performance) u1)),
+        performance-score: (calculate-performance-score property-id tenant on-time)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-property-analytics (property-id uint))
+  (map-get? property-analytics { property-id: property-id })
+)
+
+(define-read-only (get-tenant-performance (property-id uint) (tenant principal))
+  (map-get? tenant-performance { property-id: property-id, tenant: tenant })
+)
+
+(define-read-only (calculate-performance-score (property-id uint) (tenant principal) (latest-on-time bool))
+  (match (map-get? tenant-performance { property-id: property-id, tenant: tenant })
+    performance (let (
+      (streak-bonus (if   latest-on-time (* (get payment-streak performance) u5) u50))
+      (late-penalty (if latest-on-time u60 (* (get late-payments performance) u10)))
+      (base-score u100)
+    )
+      (+ (- base-score late-penalty) streak-bonus)
+    )
+    u100
+  )
+)
+
+(define-read-only (get-property-rating (property-id uint) (rater principal) (rating-id uint))
+  (map-get? property-ratings { property-id: property-id, rater: rater, rating-id: rating-id })
+)
