@@ -18,6 +18,11 @@
 (define-constant ERR_INSUFFICIENT_MAINTENANCE_FUNDS (err u114))
 (define-constant ERR_REQUEST_ALREADY_PROCESSED (err u115))
 
+(define-constant ERR_DISPUTE_NOT_FOUND (err u116))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u117))
+(define-constant ERR_INVALID_ARBITER (err u118))
+(define-constant ERR_DISPUTE_NOT_ACTIVE (err u119))
+
 
 (define-map properties
   { property-id: uint }
@@ -547,4 +552,92 @@
 
 (define-read-only (get-property-rating (property-id uint) (rater principal) (rating-id uint))
   (map-get? property-ratings { property-id: property-id, rater: rater, rating-id: rating-id })
+)
+
+(define-map rent-escrow-disputes
+  { property-id: uint, tenant: principal, dispute-id: uint }
+  {
+    initiator: principal,
+    dispute-type: (string-ascii 30),
+    escrow-amount: uint,
+    arbiter: (optional principal),
+    status: (string-ascii 20),
+    evidence-hash: (buff 32),
+    submitted-block: uint,
+    resolved-block: uint,
+    resolution: (string-ascii 50)
+  }
+)
+
+(define-data-var dispute-counter uint u0)
+
+(define-public (initiate-rent-dispute (property-id uint) (tenant principal) (dispute-type (string-ascii 30)) (evidence-hash (buff 32)))
+  (let (
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tenant }) ERR_LEASE_NOT_FOUND))
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+    (dispute-id (+ (var-get dispute-counter) u1))
+    (rent-amount (get monthly-rent lease))
+    (caller-is-landlord (is-eq tx-sender (get landlord property)))
+    (caller-is-tenant (is-eq tx-sender tenant))
+  )
+    (asserts! (or caller-is-landlord caller-is-tenant) ERR_UNAUTHORIZED)
+    (asserts! (get active lease) ERR_LEASE_EXPIRED)
+    (map-set rent-escrow-disputes
+      { property-id: property-id, tenant: tenant, dispute-id: dispute-id }
+      {
+        initiator: tx-sender,
+        dispute-type: dispute-type,
+        escrow-amount: rent-amount,
+        arbiter: none,
+        status: "pending",
+        evidence-hash: evidence-hash,
+        submitted-block: stacks-block-height,
+        resolved-block: u0,
+        resolution: ""
+      }
+    )
+    (var-set dispute-counter dispute-id)
+    (ok dispute-id)
+  )
+)
+
+(define-public (assign-dispute-arbiter (property-id uint) (tenant principal) (dispute-id uint) (arbiter principal))
+  (let (
+    (dispute (unwrap! (map-get? rent-escrow-disputes { property-id: property-id, tenant: tenant, dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+  )
+    (asserts! (or (is-eq tx-sender (get landlord property)) (is-eq tx-sender tenant)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status dispute) "pending") ERR_DISPUTE_NOT_ACTIVE)
+    (asserts! (not (is-eq arbiter (get landlord property))) ERR_INVALID_ARBITER)
+    (asserts! (not (is-eq arbiter tenant)) ERR_INVALID_ARBITER)
+    (map-set rent-escrow-disputes
+      { property-id: property-id, tenant: tenant, dispute-id: dispute-id }
+      (merge dispute { arbiter: (some arbiter), status: "arbitration" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (property-id uint) (tenant principal) (dispute-id uint) (favor-tenant bool) (resolution (string-ascii 50)))
+  (let (
+    (dispute (unwrap! (map-get? rent-escrow-disputes { property-id: property-id, tenant: tenant, dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+    (arbiter (unwrap! (get arbiter dispute) ERR_INVALID_ARBITER))
+  )
+    (asserts! (is-eq tx-sender arbiter) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status dispute) "arbitration") ERR_DISPUTE_NOT_ACTIVE)
+    (map-set rent-escrow-disputes
+      { property-id: property-id, tenant: tenant, dispute-id: dispute-id }
+      (merge dispute {
+        status: "resolved",
+        resolved-block: stacks-block-height,
+        resolution: resolution
+      })
+    )
+    (ok favor-tenant)
+  )
+)
+
+(define-read-only (get-dispute (property-id uint) (tenant principal) (dispute-id uint))
+  (map-get? rent-escrow-disputes { property-id: property-id, tenant: tenant, dispute-id: dispute-id })
 )
