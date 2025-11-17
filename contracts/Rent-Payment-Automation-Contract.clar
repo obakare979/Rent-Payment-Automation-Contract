@@ -23,6 +23,9 @@
 (define-constant ERR_INVALID_ARBITER (err u118))
 (define-constant ERR_DISPUTE_NOT_ACTIVE (err u119))
 
+(define-constant ERR_RENEWAL_NOT_ELIGIBLE (err u120))
+(define-constant ERR_INVALID_TIER_CONFIG (err u121))
+(define-constant ERR_RENEWAL_TOO_EARLY (err u122))
 
 (define-map properties
   { property-id: uint }
@@ -640,4 +643,136 @@
 
 (define-read-only (get-dispute (property-id uint) (tenant principal) (dispute-id uint))
   (map-get? rent-escrow-disputes { property-id: property-id, tenant: tenant, dispute-id: dispute-id })
+)
+
+(define-map renewal-incentives
+  { property-id: uint }
+  {
+    enabled: bool,
+    tier1-months: uint,
+    tier1-discount: uint,
+    tier2-months: uint,
+    tier2-discount: uint,
+    tier3-months: uint,
+    tier3-discount: uint,
+    min-performance-score: uint
+  }
+)
+
+(define-map renewal-history
+  { property-id: uint, tenant: principal, renewal-count: uint }
+  {
+    original-start: uint,
+    renewed-at: uint,
+    discount-applied: uint,
+    new-end-block: uint,
+    performance-at-renewal: uint
+  }
+)
+
+(define-public (configure-renewal-incentives 
+  (property-id uint) 
+  (tier1-months uint) (tier1-discount uint)
+  (tier2-months uint) (tier2-discount uint)
+  (tier3-months uint) (tier3-discount uint)
+  (min-score uint))
+  (let ((property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND)))
+    (asserts! (is-eq (get landlord property) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (and (<= tier1-discount u100) (<= tier2-discount u100) (<= tier3-discount u100)) ERR_INVALID_TIER_CONFIG)
+    (asserts! (and (< tier1-months tier2-months) (< tier2-months tier3-months)) ERR_INVALID_TIER_CONFIG)
+    (map-set renewal-incentives
+      { property-id: property-id }
+      {
+        enabled: true,
+        tier1-months: tier1-months,
+        tier1-discount: tier1-discount,
+        tier2-months: tier2-months,
+        tier2-discount: tier2-discount,
+        tier3-months: tier3-months,
+        tier3-discount: tier3-discount,
+        min-performance-score: min-score
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (calculate-renewal-discount (property-id uint) (tenant principal))
+  (match (map-get? renewal-incentives { property-id: property-id })
+    incentive (match (map-get? leases { property-id: property-id, tenant: tenant })
+      lease (match (map-get? tenant-performance { property-id: property-id, tenant: tenant })
+        performance (let (
+          (lease-months (/ (- (get end-block lease) (get start-block lease)) u4320))
+          (perf-score (get performance-score performance))
+        )
+          (if (and (get enabled incentive) (>= perf-score (get min-performance-score incentive)))
+            (if (>= lease-months (get tier3-months incentive))
+              (ok (get tier3-discount incentive))
+              (if (>= lease-months (get tier2-months incentive))
+                (ok (get tier2-discount incentive))
+                (if (>= lease-months (get tier1-months incentive))
+                  (ok (get tier1-discount incentive))
+                  (ok u0)
+                )
+              )
+            )
+            (ok u0)
+          )
+        )
+        (ok u0)
+      )
+      ERR_LEASE_NOT_FOUND
+    )
+    (ok u0)
+  )
+)
+
+(define-public (renew-lease-with-incentive (property-id uint) (renewal-duration uint))
+  (let (
+    (lease (unwrap! (map-get? leases { property-id: property-id, tenant: tx-sender }) ERR_LEASE_NOT_FOUND))
+    (property (unwrap! (map-get? properties { property-id: property-id }) ERR_PROPERTY_NOT_FOUND))
+    (discount-rate (unwrap! (calculate-renewal-discount property-id tx-sender) ERR_RENEWAL_NOT_ELIGIBLE))
+    (base-rent (get rent-amount property))
+    (discounted-rent (- base-rent (/ (* base-rent discount-rate) u100)))
+    (renewal-count (+ u1 (get-renewal-count property-id tx-sender)))
+    (perf-score (get performance-score (default-to { payment-streak: u0, late-payments: u0, maintenance-cooperation: u5, tenant-rating: u0, tenant-rating-count: u0, performance-score: u100 } (map-get? tenant-performance { property-id: property-id, tenant: tx-sender }))))
+  )
+    (asserts! (get active lease) ERR_LEASE_EXPIRED)
+    (asserts! (> (get end-block lease) stacks-block-height) ERR_LEASE_EXPIRED)
+    (asserts! (<= (- (get end-block lease) stacks-block-height) u4320) ERR_RENEWAL_TOO_EARLY)
+    (asserts! (> discount-rate u0) ERR_RENEWAL_NOT_ELIGIBLE)
+    (map-set leases
+      { property-id: property-id, tenant: tx-sender }
+      (merge lease {
+        end-block: (+ (get end-block lease) renewal-duration),
+        monthly-rent: discounted-rent
+      })
+    )
+    (map-set renewal-history
+      { property-id: property-id, tenant: tx-sender, renewal-count: renewal-count }
+      {
+        original-start: (get start-block lease),
+        renewed-at: stacks-block-height,
+        discount-applied: discount-rate,
+        new-end-block: (+ (get end-block lease) renewal-duration),
+        performance-at-renewal: perf-score
+      }
+    )
+    (ok discounted-rent)
+  )
+)
+
+(define-read-only (get-renewal-incentive-config (property-id uint))
+  (map-get? renewal-incentives { property-id: property-id })
+)
+
+(define-read-only (get-renewal-record (property-id uint) (tenant principal) (renewal-count uint))
+  (map-get? renewal-history { property-id: property-id, tenant: tenant, renewal-count: renewal-count })
+)
+
+(define-read-only (get-renewal-count (property-id uint) (tenant principal))
+  (match (map-get? renewal-history { property-id: property-id, tenant: tenant, renewal-count: u1 })
+    record u1
+    u0
+  )
 )
